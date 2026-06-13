@@ -1,552 +1,837 @@
+#include <zephyr/kernel.h>          // Zephyr core kernel functions: sleep, timing macros, thread utilities
+#include <zephyr/sys/printk.h>      // printk() for printing debug messages to the serial console
+#include <zephyr/net/socket.h>      // BSD socket API used internally by MQTT and DNS lookup
+#include <zephyr/net/mqtt.h>        // Zephyr MQTT client API
+
+#include <modem/nrf_modem_lib.h>    // Initializes Nordic modem library
+#include <modem/lte_lc.h>           // LTE link controller API for connecting to cellular network
+#include <modem/modem_info.h>       // modem_info_string_get() for reading modem info like RSRP
+
+#include <string.h>                 // strlen(), memcpy(), memset()
+#include <errno.h>                  // Error codes such as -EAGAIN
+#include <stdio.h>                  // snprintf()
+
+#include <date_time.h>
+#include <time.h>
+
 /*
- * Copyright (c) 2017 Intel Corporation
+ * Manual declaration of Nordic modem AT command function.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * This function sends AT commands directly to the modem.
+ * Example:
+ *   AT+CPIN?
+ *   AT+CEREG?
+ *   AT+CSQ
+ *
+ * The modem response is written into the buffer passed as the first argument.
  */
+int nrf_modem_at_cmd(void *buf, size_t len, const char *fmt, ...);
 
-#include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(net_mqtt_publisher_sample, LOG_LEVEL_DBG);
 
-#include <zephyr/kernel.h>
-#include <zephyr/net/socket.h>
-#include <zephyr/net/mqtt.h>
-#include <zephyr/random/random.h>
+/*
+ * AWS IoT Core MQTT endpoint.
+ *
+ * This is your device data endpoint from AWS IoT Core.
+ * The nRF board connects to this address using MQTT over TLS.
+ */
+#define AWS_ENDPOINT "ac9ylqbi6jw1g-ats.iot.us-east-1.amazonaws.com"
 
-#include <string.h>
-#include <errno.h>
+/*
+ * Secure MQTT port.
+ *
+ * Port 8883 is the standard port for MQTT over TLS.
+ * AWS IoT Core requires TLS for secure device communication.
+ */
+#define AWS_PORT "8883"
 
-#include "config.h"
-#include "net_sample_common.h"
+/*
+ * MQTT client ID.
+ *
+ * This identifies your device to AWS IoT Core.
+ * For production, each physical device should have a unique client ID.
+ */
+#define CLIENT_ID "nrf-try-1"
 
-#if defined(CONFIG_USERSPACE)
-#include <zephyr/app_memory/app_memdomain.h>
-K_APPMEM_PARTITION_DEFINE(app_partition);
-struct k_mem_domain app_domain;
-#define APP_BMEM K_APP_BMEM(app_partition)
-#define APP_DMEM K_APP_DMEM(app_partition)
-#else
-#define APP_BMEM
-#define APP_DMEM
-#endif
+/*
+ * MQTT topic where the board publishes telemetry data.
+ *
+ * AWS IoT Core receives messages on this topic.
+ * Later, an AWS IoT Rule can forward this data to Lambda, API Gateway,
+ * DynamoDB, PostgreSQL, or another backend.
+ */
+#define MQTT_TOPIC "traps/trap_001/telemetry"
 
-/* Buffers for MQTT client. */
-static APP_BMEM uint8_t rx_buffer[APP_MQTT_BUFFER_SIZE];
-static APP_BMEM uint8_t tx_buffer[APP_MQTT_BUFFER_SIZE];
+/*
+ * TLS security tag.
+ *
+ * On Nordic cellular modems, certificates are stored inside the modem.
+ * The TLS_SEC_TAG tells the modem which certificate set to use.
+ *
+ * In your case, security tag 42 should contain:
+ *   - Amazon Root CA
+ *   - Device certificate
+ *   - Device private key
+ */
+#define TLS_SEC_TAG 42
 
-#if defined(CONFIG_MQTT_LIB_WEBSOCKET)
-/* Making RX buffer large enough that the full IPv6 packet can fit into it */
-#define MQTT_LIB_WEBSOCKET_RECV_BUF_LEN 1280
 
-/* Websocket needs temporary buffer to store partial packets */
-static APP_BMEM uint8_t temp_ws_rx_buf[MQTT_LIB_WEBSOCKET_RECV_BUF_LEN];
-#endif
+/*
+ * Main MQTT client structure.
+ *
+ * This stores all MQTT client configuration:
+ *   - broker address
+ *   - client ID
+ *   - buffers
+ *   - TLS settings
+ *   - event callback
+ */
+static struct mqtt_client client;
 
-/* The mqtt client struct */
-static APP_BMEM struct mqtt_client client_ctx;
+/*
+ * Broker address storage.
+ *
+ * getaddrinfo() resolves the AWS endpoint into an IP address.
+ * The resolved IP address is copied into this variable.
+ */
+static struct sockaddr_storage broker;
 
-/* MQTT Broker details. */
-static APP_BMEM struct sockaddr_storage broker;
+/*
+ * MQTT receive buffer.
+ *
+ * Incoming MQTT packets from AWS are stored here.
+ * Examples:
+ *   - CONNACK
+ *   - PUBACK
+ *   - PINGRESP
+ */
+static uint8_t rx_buffer[1024];
 
-#if defined(CONFIG_SOCKS)
-static APP_BMEM struct sockaddr socks5_proxy;
-#endif
+/*
+ * MQTT transmit buffer.
+ *
+ * Outgoing MQTT packets are assembled here before being sent.
+ * Examples:
+ *   - CONNECT
+ *   - PUBLISH
+ *   - PINGREQ
+ */
+static uint8_t tx_buffer[1024];
 
-static APP_BMEM struct pollfd fds[1];
-static APP_BMEM int nfds;
+/*
+ * Connection status flag.
+ *
+ * false means MQTT connection is not fully established yet.
+ * true means AWS accepted the MQTT CONNECT packet and returned CONNACK.
+ */
+static bool mqtt_connected = false;
 
-static APP_BMEM bool connected;
 
-#if defined(CONFIG_MQTT_LIB_TLS)
-
-#include "test_certs.h"
-
-#define TLS_SNI_HOSTNAME "localhost"
-#define APP_CA_CERT_TAG 1
-#define APP_PSK_TAG 2
-
-static APP_DMEM sec_tag_t m_sec_tags[] = {
-#if defined(MBEDTLS_X509_CRT_PARSE_C) || defined(CONFIG_NET_SOCKETS_OFFLOAD)
-		APP_CA_CERT_TAG,
-#endif
-#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
-		APP_PSK_TAG,
-#endif
-};
-
-static int tls_init(void)
+/*
+ * Helper function for sending AT commands to the modem.
+ *
+ * This is mainly for debugging.
+ * It sends one AT command, prints the command, then prints the modem response.
+ */
+static void run_at(const char *cmd)
 {
-	int err = -EINVAL;
+    /*
+     * Buffer used to store the modem response.
+     * Initialized to zero so that it is safely null-terminated.
+     */
+    char resp[512] = {0};
 
-#if defined(MBEDTLS_X509_CRT_PARSE_C) || defined(CONFIG_NET_SOCKETS_OFFLOAD)
-	err = tls_credential_add(APP_CA_CERT_TAG, TLS_CREDENTIAL_CA_CERTIFICATE,
-				 ca_certificate, sizeof(ca_certificate));
-	if (err < 0) {
-		LOG_ERR("Failed to register public certificate: %d", err);
-		return err;
-	}
-#endif
+    /*
+     * Send the AT command to the modem.
+     *
+     * "%s" means the command string is inserted directly.
+     * The modem response is written into resp.
+     */
+    int err = nrf_modem_at_cmd(resp, sizeof(resp), "%s", cmd);
 
-#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
-	err = tls_credential_add(APP_PSK_TAG, TLS_CREDENTIAL_PSK,
-				 client_psk, sizeof(client_psk));
-	if (err < 0) {
-		LOG_ERR("Failed to register PSK: %d", err);
-		return err;
-	}
+    printk("\nCMD: %s\n", cmd);
 
-	err = tls_credential_add(APP_PSK_TAG, TLS_CREDENTIAL_PSK_ID,
-				 client_psk_id, sizeof(client_psk_id) - 1);
-	if (err < 0) {
-		LOG_ERR("Failed to register PSK ID: %d", err);
-	}
-#endif
-
-	return err;
+    /*
+     * If err is nonzero, the AT command failed.
+     * Otherwise, print the modem response.
+     */
+    if (err) {
+        printk("ERR: %d\n", err);
+    } else {
+        printk("RESP:\n%s\n", resp);
+    }
 }
 
-#endif /* CONFIG_MQTT_LIB_TLS */
 
-static void prepare_fds(struct mqtt_client *client)
+/*
+ * LTE diagnostic checks.
+ *
+ * These AT commands help you understand the modem/network state.
+ * This is useful before and after LTE connection.
+ */
+static void lte_debug_checks(void)
 {
-	if (client->transport.type == MQTT_TRANSPORT_NON_SECURE) {
-		fds[0].fd = client->transport.tcp.sock;
-	}
-#if defined(CONFIG_MQTT_LIB_TLS)
-	else if (client->transport.type == MQTT_TRANSPORT_SECURE) {
-		fds[0].fd = client->transport.tls.sock;
-	}
-#endif
+    /*
+     * Checks SIM status.
+     * Expected good response: +CPIN: READY
+     */
+    run_at("AT+CPIN?");
 
-	fds[0].events = POLLIN;
-	nfds = 1;
+    /*
+     * Checks LTE registration status.
+     *
+     * Important values:
+     *   1 = registered on home network
+     *   5 = registered while roaming
+     */
+    run_at("AT+CEREG?");
+
+    /*
+     * Basic signal quality.
+     * This is older/less detailed than CESQ but still useful.
+     */
+    run_at("AT+CSQ");
+
+    /*
+     * Extended signal quality.
+     * Gives more LTE-specific signal information.
+     */
+    run_at("AT+CESQ");
+
+    /*
+     * Checks whether the modem is attached to packet data service.
+     * Expected good response: +CGATT: 1
+     */
+    run_at("AT+CGATT?");
+
+    /*
+     * Shows PDP context settings.
+     * This confirms APN configuration.
+     */
+    run_at("AT+CGDCONT?");
+
+    /*
+     * Shows assigned IP address after cellular connection.
+     */
+    run_at("AT+CGPADDR");
+
+    /*
+     * Shows selected cellular operator.
+     */
+    run_at("AT+COPS?");
 }
 
-static void clear_fds(void)
+
+/*
+ * MQTT event handler.
+ *
+ * Zephyr calls this function whenever an MQTT event happens.
+ * Examples:
+ *   - connection accepted
+ *   - disconnected
+ *   - publish acknowledged
+ */
+static void mqtt_evt_handler(struct mqtt_client *client,
+                             const struct mqtt_evt *evt)
 {
-	nfds = 0;
+    switch (evt->type) {
+
+    /*
+     * MQTT_EVT_CONNACK means the broker responded to our CONNECT request.
+     *
+     * evt->result == 0 means the connection was accepted.
+     * If nonzero, AWS rejected the connection.
+     */
+    case MQTT_EVT_CONNACK:
+        printk("MQTT_EVT_CONNACK result: %d\n", evt->result);
+
+        if (evt->result == 0) {
+            mqtt_connected = true;
+            printk("Connected to AWS IoT Core\n");
+        }
+        break;
+
+    /*
+     * MQTT_EVT_DISCONNECT means the MQTT connection was closed.
+     *
+     * This can happen because of:
+     *   - network loss
+     *   - TLS failure
+     *   - AWS closing the connection
+     *   - keepalive timeout
+     */
+    case MQTT_EVT_DISCONNECT:
+        printk("MQTT disconnected, result: %d\n", evt->result);
+        mqtt_connected = false;
+        break;
+
+    /*
+     * MQTT_EVT_PUBACK means AWS acknowledged a QoS 1 publish.
+     *
+     * Since you publish using MQTT_QOS_1_AT_LEAST_ONCE,
+     * AWS sends PUBACK after receiving the message.
+     */
+    case MQTT_EVT_PUBACK:
+        printk("AWS received message. PUBACK id: %u\n",
+               evt->param.puback.message_id);
+        break;
+
+    /*
+     * Other MQTT events are ignored for now.
+     */
+    default:
+        break;
+    }
 }
 
-static int wait(int timeout)
+
+/*
+ * Resolve AWS IoT endpoint into an IP address.
+ *
+ * MQTT needs a socket address, not just a hostname.
+ * getaddrinfo() performs DNS lookup using the LTE network.
+ */
+static int broker_init(void)
 {
-	int ret = 0;
+    struct addrinfo *res;
 
-	if (nfds > 0) {
-		ret = poll(fds, nfds, timeout);
-		if (ret < 0) {
-			LOG_ERR("poll error: %d", errno);
-		}
-	}
+    /*
+     * DNS lookup hints.
+     *
+     * AF_INET means IPv4.
+     * SOCK_STREAM means TCP.
+     * MQTT over TLS uses TCP.
+     */
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM
+    };
 
-	return ret;
+    /*
+     * Resolve AWS_ENDPOINT and AWS_PORT.
+     *
+     * If successful, res points to the resolved address.
+     */
+    int err = getaddrinfo(AWS_ENDPOINT, AWS_PORT, &hints, &res);
+
+    if (err) {
+        printk("DNS lookup failed: %d\n", err);
+        return err;
+    }
+
+    /*
+     * Copy resolved AWS broker address into global broker variable.
+     * The MQTT client will use this address during mqtt_connect().
+     */
+    memcpy(&broker, res->ai_addr, res->ai_addrlen);
+
+    /*
+     * Free memory allocated by getaddrinfo().
+     */
+    freeaddrinfo(res);
+
+    printk("AWS endpoint resolved\n");
+    return 0;
 }
 
-void mqtt_evt_handler(struct mqtt_client *const client,
-		      const struct mqtt_evt *evt)
+
+/*
+ * Configure the Zephyr MQTT client.
+ *
+ * This function does not connect yet.
+ * It only fills the MQTT client structure with the required settings.
+ */
+static void mqtt_client_setup(void)
 {
-	int err;
+    /*
+     * sec_tags tells the modem which TLS credentials to use.
+     *
+     * TLS_SEC_TAG 42 must already be provisioned into the modem.
+     */
+    static sec_tag_t sec_tags[] = { TLS_SEC_TAG };
 
-	switch (evt->type) {
-	case MQTT_EVT_CONNACK:
-		if (evt->result != 0) {
-			LOG_ERR("MQTT connect failed %d", evt->result);
-			break;
-		}
+    /*
+     * Initialize MQTT client structure to default values.
+     */
+    mqtt_client_init(&client);
 
-		connected = true;
-		LOG_INF("MQTT client connected!");
+    /*
+     * Set the broker address.
+     * broker was filled earlier by broker_init().
+     */
+    client.broker = &broker;
 
-		break;
+    /*
+     * Register the MQTT event callback.
+     * MQTT events will be passed to mqtt_evt_handler().
+     */
+    client.evt_cb = mqtt_evt_handler;
 
-	case MQTT_EVT_DISCONNECT:
-		LOG_INF("MQTT client disconnected %d", evt->result);
+    /*
+     * Set MQTT client ID.
+     *
+     * AWS uses this to identify the device.
+     */
+    client.client_id.utf8 = (uint8_t *)CLIENT_ID;
+    client.client_id.size = strlen(CLIENT_ID);
 
-		connected = false;
-		clear_fds();
+    /*
+     * AWS IoT Core does not use username/password here.
+     * Authentication is done using TLS certificates.
+     */
+    client.password = NULL;
+    client.user_name = NULL;
 
-		break;
+    /*
+     * Use MQTT version 3.1.1.
+     * AWS IoT Core supports this.
+     */
+    client.protocol_version = MQTT_VERSION_3_1_1;
 
-	case MQTT_EVT_PUBACK:
-		if (evt->result != 0) {
-			LOG_ERR("MQTT PUBACK error %d", evt->result);
-			break;
-		}
+    /*
+     * Assign receive and transmit buffers.
+     */
+    client.rx_buf = rx_buffer;
+    client.rx_buf_size = sizeof(rx_buffer);
+    client.tx_buf = tx_buffer;
+    client.tx_buf_size = sizeof(tx_buffer);
 
-		LOG_INF("PUBACK packet id: %u", evt->param.puback.message_id);
+    /*
+     * MQTT keepalive interval in seconds.
+     *
+     * If no data is sent for 60 seconds, the client sends a PINGREQ.
+     * This helps keep the connection alive.
+     */
+    client.keepalive = 60;
 
-		break;
+    /*
+     * Use secure MQTT transport.
+     *
+     * This means MQTT over TLS on port 8883.
+     */
+    client.transport.type = MQTT_TRANSPORT_SECURE;
 
-	case MQTT_EVT_PUBREC:
-		if (evt->result != 0) {
-			LOG_ERR("MQTT PUBREC error %d", evt->result);
-			break;
-		}
+    /*
+     * Require server certificate verification.
+     *
+     * This verifies that the board is really talking to AWS IoT Core.
+     */
+    client.transport.tls.config.peer_verify = TLS_PEER_VERIFY_REQUIRED;
 
-		LOG_INF("PUBREC packet id: %u", evt->param.pubrec.message_id);
+    /*
+     * Tell the modem which stored certificates/private key to use.
+     */
+    client.transport.tls.config.sec_tag_list = sec_tags;
+    client.transport.tls.config.sec_tag_count = 1;
 
-		const struct mqtt_pubrel_param rel_param = {
-			.message_id = evt->param.pubrec.message_id
-		};
+    /*
+     * Hostname used for TLS verification.
+     *
+     * This must match the AWS endpoint certificate.
+     */
+    client.transport.tls.config.hostname = AWS_ENDPOINT;
 
-		err = mqtt_publish_qos2_release(client, &rel_param);
-		if (err != 0) {
-			LOG_ERR("Failed to send MQTT PUBREL: %d", err);
-		}
-
-		break;
-
-	case MQTT_EVT_PUBCOMP:
-		if (evt->result != 0) {
-			LOG_ERR("MQTT PUBCOMP error %d", evt->result);
-			break;
-		}
-
-		LOG_INF("PUBCOMP packet id: %u",
-			evt->param.pubcomp.message_id);
-
-		break;
-
-	case MQTT_EVT_PINGRESP:
-		LOG_INF("PINGRESP packet");
-		break;
-
-	default:
-		break;
-	}
+    /*
+     * NULL means use modem/default supported cipher suites.
+     */
+    client.transport.tls.config.cipher_list = NULL;
 }
 
-static char *get_mqtt_payload(enum mqtt_qos qos)
+
+/*
+ * Process MQTT traffic.
+ *
+ * This must be called repeatedly.
+ * MQTT is not fully automatic; the application must give the MQTT client
+ * CPU time to process incoming packets and keepalive messages.
+ */
+static int mqtt_process(void)
 {
-#if APP_BLUEMIX_TOPIC
-	static APP_BMEM char payload[30];
+    int err;
 
-	snprintk(payload, sizeof(payload), "{d:{temperature:%d}}",
-		 sys_rand8_get());
-#else
-	static APP_DMEM char payload[] = "DOORS:OPEN_QoSx";
+    /*
+     * mqtt_input() reads incoming MQTT data from the socket.
+     *
+     * This is how CONNACK, PUBACK, DISCONNECT, etc. are processed.
+     */
+    err = mqtt_input(&client);
 
-	payload[strlen(payload) - 1] = '0' + qos;
-#endif
+    /*
+     * -EAGAIN means no data is available right now.
+     * That is not a real failure.
+     */
+    if (err && err != -EAGAIN) {
+        printk("mqtt_input error: %d\n", err);
+        return err;
+    }
 
-	return payload;
+    /*
+     * mqtt_live() handles MQTT keepalive.
+     *
+     * It sends PINGREQ when needed.
+     */
+    err = mqtt_live(&client);
+
+    if (err && err != -EAGAIN) {
+        printk("mqtt_live error: %d\n", err);
+        return err;
+    }
+
+    return 0;
 }
 
-static char *get_mqtt_topic(void)
+
+/*
+ * Publish one telemetry message to AWS IoT Core.
+ *
+ * Current payload is hardcoded for testing.
+ * Later you can replace voltage and RSRP with real sensor/modem values.
+ */
+static int publish_to_aws(const char *payload)
 {
-#if APP_BLUEMIX_TOPIC
-	return "iot-2/type/"BLUEMIX_DEVTYPE"/id/"BLUEMIX_DEVID
-	       "/evt/"BLUEMIX_EVENT"/fmt/"BLUEMIX_FORMAT;
-#else
-	return "sensors";
-#endif
+    /*
+     * MQTT message ID.
+     *
+     * QoS 1 messages need message IDs so PUBACK can be matched
+     * to the original publish.
+     */
+    static uint16_t message_id = 1;
+
+    /*
+     * Payload buffer.
+     *
+     * This stores the JSON string that will be published.
+     */
+    //char payload[256];
+
+    /*
+     * Create JSON telemetry payload.
+     *
+     * This is the actual message AWS receives.
+     */
+    // snprintf(payload, sizeof(payload),"{\"device_id\":\"trap_001\",\"status\":\"active\",\"voltage\":5.72,\"rsrp\":-96}");
+
+    /*
+     * MQTT publish parameter structure.
+     * Clear it first so unused fields are zero.
+     */
+    struct mqtt_publish_param param;
+    memset(&param, 0, sizeof(param));
+
+    /*
+     * Set MQTT topic and QoS.
+     *
+     * QoS 1 means:
+     *   - message is delivered at least once
+     *   - AWS sends PUBACK after receiving it
+     *   - duplicate delivery is possible if retry happens
+     */
+    param.message.topic.qos = MQTT_QOS_1_AT_LEAST_ONCE;
+    param.message.topic.topic.utf8 = (uint8_t *)MQTT_TOPIC;
+    param.message.topic.topic.size = strlen(MQTT_TOPIC);
+
+    /*
+     * Attach payload data.
+     */
+    param.message.payload.data = (uint8_t *)payload;
+    param.message.payload.len = strlen(payload);
+
+    /*
+     * Assign unique message ID.
+     */
+    param.message_id = message_id++;
+
+    /*
+     * dup_flag = 0 means this is not a duplicate retransmission.
+     */
+    param.dup_flag = 0;
+
+    /*
+     * retain_flag = 0 means AWS should not retain this message
+     * as the last known message on the topic.
+     */
+    param.retain_flag = 0;
+
+    printk("Publishing to AWS: %s\n", payload);
+
+    /*
+     * Send the MQTT PUBLISH packet.
+     */
+    return mqtt_publish(&client, &param);
 }
 
-static int publish(struct mqtt_client *client, enum mqtt_qos qos)
-{
-	struct mqtt_publish_param param;
-
-	param.message.topic.qos = qos;
-	param.message.topic.topic.utf8 = (uint8_t *)get_mqtt_topic();
-	param.message.topic.topic.size =
-			strlen(param.message.topic.topic.utf8);
-	param.message.payload.data = get_mqtt_payload(qos);
-	param.message.payload.len =
-			strlen(param.message.payload.data);
-	param.message_id = sys_rand16_get();
-	param.dup_flag = 0U;
-	param.retain_flag = 0U;
-
-	return mqtt_publish(client, &param);
-}
-
-#define RC_STR(rc) ((rc) == 0 ? "OK" : "ERROR")
-
-#define PRINT_RESULT(func, rc) \
-	LOG_INF("%s: %d <%s>", (func), rc, RC_STR(rc))
-
-static void broker_init(void)
-{
-#if defined(CONFIG_NET_IPV6)
-	struct sockaddr_in6 *broker6 = (struct sockaddr_in6 *)&broker;
-
-	broker6->sin6_family = AF_INET6;
-	broker6->sin6_port = htons(SERVER_PORT);
-	inet_pton(AF_INET6, SERVER_ADDR, &broker6->sin6_addr);
-
-#if defined(CONFIG_SOCKS)
-	struct sockaddr_in6 *proxy6 = (struct sockaddr_in6 *)&socks5_proxy;
-
-	proxy6->sin6_family = AF_INET6;
-	proxy6->sin6_port = htons(SOCKS5_PROXY_PORT);
-	inet_pton(AF_INET6, SOCKS5_PROXY_ADDR, &proxy6->sin6_addr);
-#endif
-#else
-	struct sockaddr_in *broker4 = (struct sockaddr_in *)&broker;
-
-	broker4->sin_family = AF_INET;
-	broker4->sin_port = htons(SERVER_PORT);
-	inet_pton(AF_INET, SERVER_ADDR, &broker4->sin_addr);
-#if defined(CONFIG_SOCKS)
-	struct sockaddr_in *proxy4 = (struct sockaddr_in *)&socks5_proxy;
-
-	proxy4->sin_family = AF_INET;
-	proxy4->sin_port = htons(SOCKS5_PROXY_PORT);
-	inet_pton(AF_INET, SOCKS5_PROXY_ADDR, &proxy4->sin_addr);
-#endif
-#endif
-}
-
-static void client_init(struct mqtt_client *client)
-{
-	mqtt_client_init(client);
-
-	broker_init();
-
-	/* MQTT client configuration */
-	client->broker = &broker;
-	client->evt_cb = mqtt_evt_handler;
-	client->client_id.utf8 = (uint8_t *)MQTT_CLIENTID;
-	client->client_id.size = strlen(MQTT_CLIENTID);
-	client->password = NULL;
-	client->user_name = NULL;
-	client->protocol_version = MQTT_VERSION_3_1_1;
-
-	/* MQTT buffers configuration */
-	client->rx_buf = rx_buffer;
-	client->rx_buf_size = sizeof(rx_buffer);
-	client->tx_buf = tx_buffer;
-	client->tx_buf_size = sizeof(tx_buffer);
-
-	/* MQTT transport configuration */
-#if defined(CONFIG_MQTT_LIB_TLS)
-#if defined(CONFIG_MQTT_LIB_WEBSOCKET)
-	client->transport.type = MQTT_TRANSPORT_SECURE_WEBSOCKET;
-#else
-	client->transport.type = MQTT_TRANSPORT_SECURE;
-#endif
-
-	struct mqtt_sec_config *tls_config = &client->transport.tls.config;
-
-	tls_config->peer_verify = TLS_PEER_VERIFY_REQUIRED;
-	tls_config->cipher_list = NULL;
-	tls_config->sec_tag_list = m_sec_tags;
-	tls_config->sec_tag_count = ARRAY_SIZE(m_sec_tags);
-#if defined(MBEDTLS_X509_CRT_PARSE_C) || defined(CONFIG_NET_SOCKETS_OFFLOAD)
-	tls_config->hostname = TLS_SNI_HOSTNAME;
-#else
-	tls_config->hostname = NULL;
-#endif
-
-#else
-#if defined(CONFIG_MQTT_LIB_WEBSOCKET)
-	client->transport.type = MQTT_TRANSPORT_NON_SECURE_WEBSOCKET;
-#else
-	client->transport.type = MQTT_TRANSPORT_NON_SECURE;
-#endif
-#endif
-
-#if defined(CONFIG_MQTT_LIB_WEBSOCKET)
-	client->transport.websocket.config.host = SERVER_ADDR;
-	client->transport.websocket.config.url = "/mqtt";
-	client->transport.websocket.config.tmp_buf = temp_ws_rx_buf;
-	client->transport.websocket.config.tmp_buf_len =
-						sizeof(temp_ws_rx_buf);
-	client->transport.websocket.timeout = 5 * MSEC_PER_SEC;
-#endif
-
-#if defined(CONFIG_SOCKS)
-	mqtt_client_set_proxy(client, &socks5_proxy,
-			      socks5_proxy.sa_family == AF_INET ?
-			      sizeof(struct sockaddr_in) :
-			      sizeof(struct sockaddr_in6));
-#endif
-}
-
-/* In this routine we block until the connected variable is 1 */
-static int try_to_connect(struct mqtt_client *client)
-{
-	int rc, i = 0;
-
-	while (i++ < APP_CONNECT_TRIES && !connected) {
-
-		client_init(client);
-
-		rc = mqtt_connect(client);
-		if (rc != 0) {
-			PRINT_RESULT("mqtt_connect", rc);
-			k_sleep(K_MSEC(APP_SLEEP_MSECS));
-			continue;
-		}
-
-		prepare_fds(client);
-
-		if (wait(APP_CONNECT_TIMEOUT_MS)) {
-			mqtt_input(client);
-		}
-
-		if (!connected) {
-			mqtt_abort(client);
-		}
-	}
-
-	if (connected) {
-		return 0;
-	}
-
-	return -EINVAL;
-}
-
-static int process_mqtt_and_sleep(struct mqtt_client *client, int timeout)
-{
-	int64_t remaining = timeout;
-	int64_t start_time = k_uptime_get();
-	int rc;
-
-	while (remaining > 0 && connected) {
-		if (wait(remaining)) {
-			rc = mqtt_input(client);
-			if (rc != 0) {
-				PRINT_RESULT("mqtt_input", rc);
-				return rc;
-			}
-		}
-
-		rc = mqtt_live(client);
-		if (rc != 0 && rc != -EAGAIN) {
-			PRINT_RESULT("mqtt_live", rc);
-			return rc;
-		} else if (rc == 0) {
-			rc = mqtt_input(client);
-			if (rc != 0) {
-				PRINT_RESULT("mqtt_input", rc);
-				return rc;
-			}
-		}
-
-		remaining = timeout + start_time - k_uptime_get();
-	}
-
-	return 0;
-}
-
-#define SUCCESS_OR_EXIT(rc) { if (rc != 0) { return 1; } }
-#define SUCCESS_OR_BREAK(rc) { if (rc != 0) { break; } }
-
-static int publisher(void)
-{
-	int i, rc, r = 0;
-
-	LOG_INF("attempting to connect: ");
-	rc = try_to_connect(&client_ctx);
-	PRINT_RESULT("try_to_connect", rc);
-	SUCCESS_OR_EXIT(rc);
-
-	i = 0;
-	while (i++ < CONFIG_NET_SAMPLE_APP_MAX_ITERATIONS && connected) {
-		r = -1;
-
-		rc = mqtt_ping(&client_ctx);
-		PRINT_RESULT("mqtt_ping", rc);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = publish(&client_ctx, MQTT_QOS_0_AT_MOST_ONCE);
-		PRINT_RESULT("mqtt_publish", rc);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = publish(&client_ctx, MQTT_QOS_1_AT_LEAST_ONCE);
-		PRINT_RESULT("mqtt_publish", rc);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = publish(&client_ctx, MQTT_QOS_2_EXACTLY_ONCE);
-		PRINT_RESULT("mqtt_publish", rc);
-		SUCCESS_OR_BREAK(rc);
-
-		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-		SUCCESS_OR_BREAK(rc);
-
-		r = 0;
-	}
-
-	rc = mqtt_disconnect(&client_ctx);
-	PRINT_RESULT("mqtt_disconnect", rc);
-
-	LOG_INF("Bye!");
-
-	return r;
-}
-
-static int start_app(void)
-{
-	int r = 0, i = 0;
-
-	while (!CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS ||
-	       i++ < CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS) {
-		r = publisher();
-
-		if (!CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS) {
-			k_sleep(K_MSEC(5000));
-		}
-	}
-
-	return r;
-}
-
-#if defined(CONFIG_USERSPACE)
-#define STACK_SIZE 2048
-
-#if defined(CONFIG_NET_TC_THREAD_COOPERATIVE)
-#define THREAD_PRIORITY K_PRIO_COOP(CONFIG_NUM_COOP_PRIORITIES - 1)
-#else
-#define THREAD_PRIORITY K_PRIO_PREEMPT(8)
-#endif
-
-K_THREAD_DEFINE(app_thread, STACK_SIZE,
-		start_app, NULL, NULL, NULL,
-		THREAD_PRIORITY, K_USER, -1);
-
-static K_HEAP_DEFINE(app_mem_pool, 1024 * 2);
-#endif
 
 int main(void)
 {
-	wait_for_network();
+    int err;
 
-#if defined(CONFIG_MQTT_LIB_TLS)
-	int rc;
+    printk("Starting minimal AWS MQTT test with LTE diagnostics\n");
 
-	rc = tls_init();
-	PRINT_RESULT("tls_init", rc);
-#endif
+    /*
+     * Initialize Nordic modem library.
+     *
+     * This must be done before using:
+     *   - LTE functions
+     *   - AT commands
+     *   - sockets through the modem
+     */
+    err = nrf_modem_lib_init();
 
-#if defined(CONFIG_USERSPACE)
-	int ret;
+    if (err) {
+        printk("nrf_modem_lib_init failed: %d\n", err);
+        return 0;
+    }
 
-	struct k_mem_partition *parts[] = {
-#if Z_LIBC_PARTITION_EXISTS
-		&z_libc_partition,
-#endif
-		&app_partition
-	};
+    printk("Modem initialized\n");
 
-	ret = k_mem_domain_init(&app_domain, ARRAY_SIZE(parts), parts);
-	__ASSERT(ret == 0, "k_mem_domain_init() failed %d", ret);
-	ARG_UNUSED(ret);
+    printk("Configuring modem for Hologram...\n");
 
-	k_mem_domain_add_thread(&app_domain, app_thread);
-	k_thread_heap_assign(app_thread, &app_mem_pool);
+    /*
+     * Set modem system mode.
+     *
+     * AT%XSYSTEMMODE=1,0,0,0 means:
+     *   LTE-M enabled
+     *   NB-IoT disabled
+     *   GNSS disabled
+     *   LTE preference disabled/default
+     */
+    run_at("AT%XSYSTEMMODE=1,0,0,0");
 
-	k_thread_start(app_thread);
-	k_thread_join(app_thread, K_FOREVER);
-#else
-	exit(start_app());
-#endif
-	return 0;
+    /*
+     * Set APN for Hologram SIM.
+     *
+     * PDP context 1 uses IP type and APN "hologram".
+     */
+    run_at("AT+CGDCONT=1,\"IP\",\"hologram\"");
+
+    /*
+     * Turn modem off.
+     *
+     * This forces the modem to reset radio/network state.
+     */
+    run_at("AT+CFUN=0");
+
+    /*
+     * Wait 2 seconds for modem state change.
+     */
+    k_sleep(K_SECONDS(2));
+
+    /*
+     * Turn modem back on in full functionality mode.
+     */
+    run_at("AT+CFUN=1");
+
+    /*
+     * Wait 5 seconds before checking LTE state.
+     */
+    k_sleep(K_SECONDS(5));
+
+    printk("\nLTE checks before connect:\n");
+
+    /*
+     * Print modem/network state before LTE connection attempt.
+     */
+    lte_debug_checks();
+
+    printk("\nBefore LTE connect\n");
+
+    /*
+     * Connect to LTE network.
+     *
+     * This blocks until connected or failure/timeout depending on config.
+     */
+    err = lte_lc_connect();
+
+    printk("After LTE connect: %d\n", err);
+
+    printk("\nLTE checks after connect:\n");
+
+    /*
+     * Print modem/network state after LTE connection attempt.
+     */
+    lte_debug_checks();
+
+    /*
+     * If LTE failed, stop here.
+     * MQTT cannot work without cellular data connection.
+     */
+    if (err) {
+        printk("LTE connection failed, stopping before AWS/MQTT.\n");
+        return 0;
+    }
+
+    printk("LTE connected\n");
+
+    /*
+     * Resolve AWS endpoint through DNS.
+     */
+    err = broker_init();
+
+    if (err) {
+        printk("broker_init failed: %d\n", err);
+        return 0;
+    }
+
+    /*
+     * Fill MQTT client structure with AWS, TLS, buffer, and callback settings.
+     */
+    mqtt_client_setup();
+
+    /*
+     * Start MQTT connection to AWS.
+     *
+     * This sends the MQTT CONNECT packet over TLS.
+     */
+    err = mqtt_connect(&client);
+
+    if (err) {
+        printk("mqtt_connect failed: %d\n", err);
+        return 0;
+    }
+
+    printk("mqtt_connect called\n");
+
+    /*
+     * Wait until AWS sends CONNACK.
+     *
+     * mqtt_connect() only starts the connection process.
+     * The connection is not fully confirmed until MQTT_EVT_CONNACK is received.
+     */
+    while (!mqtt_connected) {
+
+        /*
+         * Process incoming MQTT packets.
+         * This is needed to receive CONNACK.
+         */
+        err = mqtt_input(&client);
+
+        if (err) {
+            printk("mqtt_input before connected failed: %d\n", err);
+            break;
+        }
+
+        /*
+         * Process MQTT keepalive logic even during connection wait.
+         */
+        err = mqtt_live(&client);
+
+        if (err && err != -EAGAIN) {
+            printk("mqtt_live before connected failed: %d\n", err);
+            break;
+        }
+
+        /*
+         * Small delay to avoid busy-looping the CPU.
+         */
+        k_sleep(K_MSEC(100));
+    }
+
+    /*
+     * Main application loop.
+     *
+     * Every loop:
+     *   1. Publish one telemetry message
+     *   2. Keep MQTT connection alive for 10 seconds
+     *   3. Repeat forever
+     */
+    while (1) {
+
+        // Attributes of board sent to server
+        const char *id = "trap_001";
+        const char *status = "active";
+
+        /* =========================
+        * SENSOR / DEVICE DATA
+        * ========================= */
+
+        // float voltage = 10.5f;   // example sensor value (can be updated dynamically)
+        float voltage = 5.0f + ((float)rand() / RAND_MAX) * (8.0f - 4.0f);
+
+        /* =========================
+        * TIME DATA
+        * ========================= */
+       // Time variables
+        int64_t unix_time_ms;
+        char time_str[32];
+
+        /* TIME CHECK */
+        if (date_time_now(&unix_time_ms) == 0){
+            int64_t unix_time_s = unix_time_ms / 1000;
+            time_t t = unix_time_s;
+            struct tm *tm_info = gmtime(&t);
+            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+            printk("Time OK\n");
+        }
+        else {
+            printk("Time NOT available\n");
+        }
+
+
+        /* =========================
+        * SIGNAL STRENGTH (RSRP)
+        * ========================= */
+
+        char rsrp_buf[64]; // buffer to hold raw RSRP value and signal quality string
+        int sig_len; // length of raw RSRP string returned by modem_info_string_get
+        float rsrp_read; 
+        char payload[256]; // buffer for final JSON payload to be sent to AWS
+
+        sig_len = modem_info_string_get(MODEM_INFO_RSRP, rsrp_buf, sizeof(rsrp_buf));
+
+        if (sig_len <= 0) {
+            printk("Failed to get RSRP, err = %d\n", sig_len);
+            snprintf(rsrp_buf, sizeof(rsrp_buf), "Unknown");
+            rsrp_read = -999.0f; // Use a sentinel value to indicate RSRP is unavailable
+        } else {
+            printk("RSRP raw value: %s\n", rsrp_buf);
+
+            int rsrp_raw = atoi(rsrp_buf);
+            int rsrp_dbm = rsrp_raw - 140;  // Convert raw RSRP to dBm (example conversion)
+            rsrp_read = rsrp_dbm;
+
+            //snprintf(rsrp_buf, sizeof(rsrp_buf), "%s (%d dBm)", signal, rsrp_dbm); // Update buffer to include signal quality and dBm value
+        }
+
+        /*==== PAYLOAD BEING SENT TO AWS ====*/
+        snprintf(payload,
+         sizeof(payload),
+         "{\"device_id\":\"%s\","
+         "\"status\":\"%s\","
+         "\"voltage\":%.2f,"
+         "\"rsrp\":%.0f,"
+         "\"timestamp\":\"%s\"}",
+         id,
+         status,
+         (double)voltage,
+         (double)rsrp_read,
+         time_str);
+
+
+
+        /*
+         * Send telemetry to AWS IoT Core.
+         */
+        err = publish_to_aws(payload);
+
+        if (err) {
+            printk("mqtt_publish failed: %d\n", err);
+        }
+
+        /*
+         * For the next 10 seconds, process MQTT events once per second.
+         *
+         * This allows:
+         *   - PUBACK messages to be received
+         *   - keepalive ping logic to run
+         *   - disconnect events to be detected
+         */
+        for (int i = 0; i < 10; i++) {
+            mqtt_process();
+            k_sleep(K_SECONDS(1));
+        }
+    }
+
+    /*
+     * This line is never reached because while(1) runs forever.
+     */
+    return 0;
 }
