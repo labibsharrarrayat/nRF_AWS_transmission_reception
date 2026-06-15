@@ -4,7 +4,6 @@ import pg8000
 import boto3
 from datetime import datetime
 
-
 DB_HOST = os.environ["DB_HOST"]
 DB_PORT = int(os.environ.get("DB_PORT", "5432"))
 DB_NAME = os.environ["DB_NAME"]
@@ -20,6 +19,7 @@ iot_client = boto3.client(
 
 
 def lambda_handler(event, context):
+
     print("Received event:", event)
 
     trap_id = event.get("device_id")
@@ -28,21 +28,31 @@ def lambda_handler(event, context):
     rsrp = event.get("rsrp")
     timestamp_str = event.get("timestamp")
 
-    device_time = None
+    #
+    # Current UTC time from AWS Lambda.
+    # Schedule lookup will use this time,
+    # not the board timestamp.
+    #
+    utc_now = datetime.utcnow()
+    current_time = utc_now.time()
 
+    #
+    # Still save the board timestamp in device_logs
+    #
     if timestamp_str:
-        device_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-        
+        device_time = datetime.strptime(
+            timestamp_str,
+            "%Y-%m-%d %H:%M:%S"
+        )
     else:
-        device_time = datetime.utcnow()
-    
-    device_clock_time = device_time.time()
+        device_time = utc_now
 
     command_status = "deactive"
 
     conn = None
 
     try:
+
         conn = pg8000.connect(
             host=DB_HOST,
             port=DB_PORT,
@@ -74,20 +84,22 @@ def lambda_handler(event, context):
             SELECT status
             FROM trap_schedule
             WHERE trap_id = %s
-            AND start_time <= %s
-            AND end_time >= %s
+              AND start_time <= %s
+              AND end_time >= %s
             LIMIT 1
             """,
             (
                 trap_id,
-                device_clock_time,
-                device_clock_time
+                current_time,
+                current_time
             )
         )
 
         row = cur.fetchone()
 
         if row:
+
+            
 
             if row[0] == "Activated":
                 command_status = "active"
@@ -112,19 +124,25 @@ def lambda_handler(event, context):
             payload=command_status
         )
 
+        print("UTC time used for schedule lookup:", current_time)
         print("Inserted telemetry into RDS")
-        print(f"Published command '{command_status}' to topic '{command_topic}'")
+        print(
+            f"Published command '{command_status}' "
+            f"to topic '{command_topic}'"
+        )
 
         return {
             "statusCode": 200,
             "body": json.dumps({
                 "message": "Telemetry inserted and command published",
                 "trap_id": trap_id,
-                "command": command_status
+                "command": command_status,
+                "utc_time_used": str(current_time)
             })
         }
 
     except Exception as e:
+
         print("ERROR:", str(e))
 
         return {
@@ -133,5 +151,6 @@ def lambda_handler(event, context):
         }
 
     finally:
+
         if conn:
             conn.close()
