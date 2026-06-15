@@ -27,6 +27,12 @@ int nrf_modem_at_cmd(void *buf, size_t len, const char *fmt, ...);
 
 #define TLS_SEC_TAG 42
 
+#define TELEMETRY_INTERVAL_SECONDS 10
+#define MQTT_PROCESS_INTERVAL_MS   100
+
+#define MQTT_THREAD_STACK_SIZE 4096
+#define MQTT_THREAD_PRIORITY   5
+
 static struct mqtt_client client;
 static struct sockaddr_storage broker;
 
@@ -34,17 +40,60 @@ static uint8_t rx_buffer[1024];
 static uint8_t tx_buffer[1024];
 
 static bool mqtt_connected = false;
+static bool mqtt_ready_for_processing = false;
 
 /*
- * This is now global and mutable.
- * Incoming MQTT command messages will update this.
- * Telemetry payload will use this value.
+ * Shared trap status.
+ *
+ * MQTT receive thread updates this.
+ * Telemetry publishing loop reads this.
  */
 static char trap_status[16] = "active";
+
+/*
+ * Mutex protects trap_status from being read and written at the same time.
+ */
+K_MUTEX_DEFINE(status_mutex);
+
+/*
+ * Mutex protects MQTT client operations because one thread calls mqtt_process()
+ * while the main loop calls mqtt_publish().
+ */
+K_MUTEX_DEFINE(mqtt_mutex);
+
+/*
+ * MQTT service thread definition.
+ */
+K_THREAD_STACK_DEFINE(mqtt_thread_stack, MQTT_THREAD_STACK_SIZE);
+static struct k_thread mqtt_thread_data;
+
+
+static void set_trap_status(const char *new_status)
+{
+    k_mutex_lock(&status_mutex, K_FOREVER);
+
+    strncpy(trap_status, new_status, sizeof(trap_status) - 1);
+    trap_status[sizeof(trap_status) - 1] = '\0';
+
+    k_mutex_unlock(&status_mutex);
+}
+
+
+static void get_trap_status(char *status_copy, size_t status_copy_size)
+{
+    k_mutex_lock(&status_mutex, K_FOREVER);
+
+    strncpy(status_copy, trap_status, status_copy_size - 1);
+    status_copy[status_copy_size - 1] = '\0';
+
+    k_mutex_unlock(&status_mutex);
+}
+
 
 static void run_at(const char *cmd)
 {
     char resp[512] = {0};
+
     int err = nrf_modem_at_cmd(resp, sizeof(resp), "%s", cmd);
 
     printk("\nCMD: %s\n", cmd);
@@ -55,6 +104,7 @@ static void run_at(const char *cmd)
         printk("RESP:\n%s\n", resp);
     }
 }
+
 
 static void lte_debug_checks(void)
 {
@@ -68,9 +118,7 @@ static void lte_debug_checks(void)
     run_at("AT+COPS?");
 }
 
-/*
- * Subscribe to the command topic after MQTT connection is confirmed.
- */
+
 static int subscribe_to_command_topic(void)
 {
     static uint16_t sub_message_id = 1000;
@@ -94,9 +142,7 @@ static int subscribe_to_command_topic(void)
     return mqtt_subscribe(&client, &sub_list);
 }
 
-/*
- * Read incoming command payload and update trap_status.
- */
+
 static void handle_command_message(const struct mqtt_publish_param *pub)
 {
     uint8_t payload_buf[128];
@@ -105,7 +151,7 @@ static void handle_command_message(const struct mqtt_publish_param *pub)
 
     memset(payload_buf, 0, sizeof(payload_buf));
 
-    while (received < payload_len && received < sizeof(payload_buf) - 1) {
+    while ((received < payload_len) && (received < sizeof(payload_buf) - 1)) {
         size_t space_left = (sizeof(payload_buf) - 1) - received;
         size_t remaining = payload_len - received;
         size_t read_len = remaining < space_left ? remaining : space_left;
@@ -131,32 +177,33 @@ static void handle_command_message(const struct mqtt_publish_param *pub)
     printk("Command received: %s\n", payload_buf);
 
     /*
-     * For now Lambda can publish simple text:
+     * Supported command payloads for now:
+     *
      * active
      * deactive
+     * deactivate
      *
-     * This also tolerates JSON-like payloads containing those words.
+     * This also works if Lambda later sends simple JSON containing
+     * the word active/deactive/deactivate.
      */
-    if (strstr((char *)payload_buf, "active") != NULL &&
-        strstr((char *)payload_buf, "deactive") == NULL) {
+    if ((strstr((char *)payload_buf, "deactive") != NULL) ||
+        (strstr((char *)payload_buf, "deactivate") != NULL)) {
 
-        strncpy(trap_status, "active", sizeof(trap_status) - 1);
-        trap_status[sizeof(trap_status) - 1] = '\0';
-
-        printk("Trap status updated to ACTIVE\n");
-    }
-    else if (strstr((char *)payload_buf, "deactive") != NULL ||
-             strstr((char *)payload_buf, "deactivate") != NULL) {
-
-        strncpy(trap_status, "deactive", sizeof(trap_status) - 1);
-        trap_status[sizeof(trap_status) - 1] = '\0';
-
+        set_trap_status("deactive");
         printk("Trap status updated to DEACTIVE\n");
     }
+    else if (strstr((char *)payload_buf, "active") != NULL) {
+
+        set_trap_status("active");
+        printk("Trap status updated to ACTIVE\n");
+    }
     else {
-        printk("Unknown command. Status unchanged: %s\n", trap_status);
+        char current_status[16];
+        get_trap_status(current_status, sizeof(current_status));
+        printk("Unknown command. Status unchanged: %s\n", current_status);
     }
 }
+
 
 static void mqtt_evt_handler(struct mqtt_client *client,
                              const struct mqtt_evt *evt)
@@ -170,11 +217,13 @@ static void mqtt_evt_handler(struct mqtt_client *client,
             mqtt_connected = true;
             printk("Connected to AWS IoT Core\n");
         }
+
         break;
 
     case MQTT_EVT_DISCONNECT:
         printk("MQTT disconnected, result: %d\n", evt->result);
         mqtt_connected = false;
+        mqtt_ready_for_processing = false;
         break;
 
     case MQTT_EVT_PUBACK:
@@ -203,12 +252,14 @@ static void mqtt_evt_handler(struct mqtt_client *client,
                 printk("Failed to send PUBACK for command: %d\n", err);
             }
         }
+
         break;
 
     default:
         break;
     }
 }
+
 
 static int broker_init(void)
 {
@@ -227,11 +278,14 @@ static int broker_init(void)
     }
 
     memcpy(&broker, res->ai_addr, res->ai_addrlen);
+
     freeaddrinfo(res);
 
     printk("AWS endpoint resolved\n");
+
     return 0;
 }
+
 
 static void mqtt_client_setup(void)
 {
@@ -252,18 +306,21 @@ static void mqtt_client_setup(void)
 
     client.rx_buf = rx_buffer;
     client.rx_buf_size = sizeof(rx_buffer);
+
     client.tx_buf = tx_buffer;
     client.tx_buf_size = sizeof(tx_buffer);
 
     client.keepalive = 60;
 
     client.transport.type = MQTT_TRANSPORT_SECURE;
+
     client.transport.tls.config.peer_verify = TLS_PEER_VERIFY_REQUIRED;
     client.transport.tls.config.sec_tag_list = sec_tags;
     client.transport.tls.config.sec_tag_count = 1;
     client.transport.tls.config.hostname = AWS_ENDPOINT;
     client.transport.tls.config.cipher_list = NULL;
 }
+
 
 static int mqtt_process(void)
 {
@@ -286,11 +343,13 @@ static int mqtt_process(void)
     return 0;
 }
 
+
 static int publish_to_aws(const char *payload)
 {
     static uint16_t message_id = 1;
 
     struct mqtt_publish_param param;
+
     memset(&param, 0, sizeof(param));
 
     param.message.topic.qos = MQTT_QOS_1_AT_LEAST_ONCE;
@@ -309,11 +368,38 @@ static int publish_to_aws(const char *payload)
     return mqtt_publish(&client, &param);
 }
 
+
+static void mqtt_service_thread(void *arg1, void *arg2, void *arg3)
+{
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+
+    printk("MQTT service thread started\n");
+
+    while (1) {
+        if (mqtt_ready_for_processing) {
+            k_mutex_lock(&mqtt_mutex, K_FOREVER);
+
+            int err = mqtt_process();
+
+            k_mutex_unlock(&mqtt_mutex);
+
+            if (err) {
+                printk("MQTT service thread mqtt_process failed: %d\n", err);
+            }
+        }
+
+        k_sleep(K_MSEC(MQTT_PROCESS_INTERVAL_MS));
+    }
+}
+
+
 int main(void)
 {
     int err;
 
-    printk("Starting AWS MQTT publish + subscribe test\n");
+    printk("Starting AWS MQTT publish + subscribe firmware\n");
 
     err = nrf_modem_lib_init();
 
@@ -373,6 +459,9 @@ int main(void)
 
     printk("mqtt_connect called\n");
 
+    /*
+     * Wait for AWS CONNACK.
+     */
     while (!mqtt_connected) {
         err = mqtt_input(&client);
 
@@ -397,28 +486,46 @@ int main(void)
     }
 
     /*
-     * This is the important subscription point.
-     * Your code already waits for CONNACK above.
-     * So we subscribe here, after connection is confirmed.
+     * Subscribe once after the connection is confirmed.
+     * Do not put this in the telemetry loop.
      */
     err = subscribe_to_command_topic();
 
     if (err) {
         printk("mqtt_subscribe failed: %d\n", err);
-    } else {
-        printk("Subscribe request sent\n");
+        return 0;
+    }
+
+    printk("Subscribe request sent\n");
+
+    /*
+     * Process MQTT briefly so SUBACK can be received before starting
+     * the dedicated MQTT service thread.
+     */
+    for (int i = 0; i < 10; i++) {
+        mqtt_process();
+        k_sleep(K_MSEC(100));
     }
 
     /*
-     * Give MQTT a moment to receive SUBACK before first telemetry publish.
+     * Now MQTT can be serviced continuously by the thread.
      */
-    for (int i = 0; i < 3; i++) {
-        mqtt_process();
-        k_sleep(K_SECONDS(1));
-    }
+    mqtt_ready_for_processing = true;
+
+    k_thread_create(&mqtt_thread_data,
+                    mqtt_thread_stack,
+                    K_THREAD_STACK_SIZEOF(mqtt_thread_stack),
+                    mqtt_service_thread,
+                    NULL,
+                    NULL,
+                    NULL,
+                    MQTT_THREAD_PRIORITY,
+                    0,
+                    K_NO_WAIT);
+
+    printk("Main telemetry loop starting\n");
 
     while (1) {
-
         const char *id = "trap_001";
 
         float voltage = 5.0f + ((float)rand() / RAND_MAX) * (8.0f - 4.0f);
@@ -429,8 +536,14 @@ int main(void)
         if (date_time_now(&unix_time_ms) == 0) {
             int64_t unix_time_s = unix_time_ms / 1000;
             time_t t = unix_time_s;
+
             struct tm *tm_info = gmtime(&t);
-            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+
+            strftime(time_str,
+                     sizeof(time_str),
+                     "%Y-%m-%d %H:%M:%S",
+                     tm_info);
+
             printk("Time OK\n");
         } else {
             printk("Time NOT available\n");
@@ -440,6 +553,9 @@ int main(void)
         int sig_len;
         float rsrp_read;
         char payload[256];
+        char current_status[16];
+
+        get_trap_status(current_status, sizeof(current_status));
 
         sig_len = modem_info_string_get(MODEM_INFO_RSRP,
                                          rsrp_buf,
@@ -447,13 +563,16 @@ int main(void)
 
         if (sig_len <= 0) {
             printk("Failed to get RSRP, err = %d\n", sig_len);
+
             snprintf(rsrp_buf, sizeof(rsrp_buf), "Unknown");
+
             rsrp_read = -999.0f;
         } else {
             printk("RSRP raw value: %s\n", rsrp_buf);
 
             int rsrp_raw = atoi(rsrp_buf);
             int rsrp_dbm = rsrp_raw - 140;
+
             rsrp_read = rsrp_dbm;
         }
 
@@ -465,26 +584,22 @@ int main(void)
                  "\"rsrp\":%.0f,"
                  "\"timestamp\":\"%s\"}",
                  id,
-                 trap_status,
+                 current_status,
                  (double)voltage,
                  (double)rsrp_read,
                  time_str);
 
+        k_mutex_lock(&mqtt_mutex, K_FOREVER);
+
         err = publish_to_aws(payload);
+
+        k_mutex_unlock(&mqtt_mutex);
 
         if (err) {
             printk("mqtt_publish failed: %d\n", err);
         }
 
-        /*
-         * This is what allows the board to receive commands.
-         * During these 10 seconds, mqtt_input() can detect incoming
-         * messages on traps/trap_001/command.
-         */
-        for (int i = 0; i < 10; i++) {
-            mqtt_process();
-            k_sleep(K_SECONDS(1));
-        }
+        k_sleep(K_SECONDS(TELEMETRY_INTERVAL_SECONDS));
     }
 
     return 0;
