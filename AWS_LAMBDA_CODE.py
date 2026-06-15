@@ -1,5 +1,7 @@
 import os
+import json
 import pg8000
+import boto3
 from datetime import datetime
 
 
@@ -8,6 +10,13 @@ DB_PORT = int(os.environ.get("DB_PORT", "5432"))
 DB_NAME = os.environ["DB_NAME"]
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
+
+IOT_DATA_ENDPOINT = os.environ["IOT_DATA_ENDPOINT"]
+
+iot_client = boto3.client(
+    "iot-data",
+    endpoint_url=f"https://{IOT_DATA_ENDPOINT}"
+)
 
 
 def lambda_handler(event, context):
@@ -20,8 +29,16 @@ def lambda_handler(event, context):
     timestamp_str = event.get("timestamp")
 
     device_time = None
+
     if timestamp_str:
         device_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+        
+    else:
+        device_time = datetime.utcnow()
+    
+    device_clock_time = device_time.time()
+
+    command_status = "deactive"
 
     conn = None
 
@@ -52,14 +69,59 @@ def lambda_handler(event, context):
             )
         )
 
+        cur.execute(
+            """
+            SELECT status
+            FROM trap_schedule
+            WHERE trap_id = %s
+            AND start_time <= %s
+            AND end_time >= %s
+            LIMIT 1
+            """,
+            (
+                trap_id,
+                device_clock_time,
+                device_clock_time
+            )
+        )
+
+        row = cur.fetchone()
+
+        if row:
+
+            if row[0] == "Activated":
+                command_status = "active"
+
+            elif row[0] == "De-activated":
+                command_status = "deactive"
+
+            else:
+                command_status = "deactive"
+
+        else:
+            command_status = "deactive"
+
         conn.commit()
         cur.close()
 
+        command_topic = f"traps/{trap_id}/command"
+
+        iot_client.publish(
+            topic=command_topic,
+            qos=1,
+            payload=command_status
+        )
+
         print("Inserted telemetry into RDS")
+        print(f"Published command '{command_status}' to topic '{command_topic}'")
 
         return {
             "statusCode": 200,
-            "body": "Telemetry inserted into RDS"
+            "body": json.dumps({
+                "message": "Telemetry inserted and command published",
+                "trap_id": trap_id,
+                "command": command_status
+            })
         }
 
     except Exception as e:
